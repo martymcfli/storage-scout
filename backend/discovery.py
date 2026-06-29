@@ -77,16 +77,27 @@ async def _discover_storage_treasures(zip_codes: list[str]) -> list[str]:
 
 
 async def _discover_bid13(zip_codes: list[str]) -> list[str]:
-    urls = []
+    """
+    Bid13 uses /node/XXXXXX URLs rendered via JavaScript.
+    We fill in the ZIP form and collect the resulting node links.
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
         for zip_code in zip_codes:
             try:
-                target = f"https://bid13.com/storage-auctions?zip={zip_code}&radius=25"
-                await page.goto(target, wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)
+                await page.goto("https://bid13.com/auctions", wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(1)
+
+                # Fill ZIP code into the search form and submit
+                zip_input = page.locator("input[placeholder*='Zip'], input[type='text']").first
+                await zip_input.fill(zip_code)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(3)
 
                 links = await page.eval_on_selector_all(
                     "a[href]",
@@ -94,17 +105,17 @@ async def _discover_bid13(zip_codes: list[str]) -> list[str]:
                 )
 
                 for link in links:
-                    if (
-                        "bid13.com" in link
-                        and re.search(r"/storage-auctions/\d+", link)
-                    ):
+                    if "bid13.com" in link and re.search(r"/node/\d+", link):
                         clean = link.split("?")[0].rstrip("/")
-                        if clean not in urls:
+                        if clean not in seen:
+                            seen.add(clean)
                             urls.append(clean)
+
             except Exception as e:
                 print(f"[Discovery] Bid13 ZIP {zip_code} error: {e}")
 
         await browser.close()
+
     return urls
 
 
