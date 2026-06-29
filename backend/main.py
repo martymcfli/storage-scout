@@ -8,6 +8,8 @@ from .models import ScrapeRequest, ChatRequest, DiscoverRequest, Alert, UserProf
 from .scraper import scrape_auction_page
 from .enrichment import enrich_tenant
 from .evaluator import evaluate_unit
+from .vision import analyze_unit_visually
+from .bid_strategy import build_bid_strategy
 from .agents import chat_stream, deep_research_unit
 from .storage import (
     get_all_auctions, get_auction_by_id, save_auction, delete_auction,
@@ -16,6 +18,8 @@ from .storage import (
 from .discovery import discover_new_auctions, filter_units_by_day
 from .profile import load_profile, save_profile, profile_exists
 from .zipradius import get_zips_in_radius, get_zip_location
+
+VISION_SCORE_THRESHOLD = 5  # run vision only on units scoring 5+
 
 app = FastAPI(title="Storage Scout API", version="1.0.0")
 
@@ -53,8 +57,9 @@ def _maybe_alert(unit, threshold: int) -> None:
 
 
 async def _run_full_pipeline(url: str, available_days: Optional[list[str]] = None) -> list:
-    """Scrape → [day filter] → enrich → evaluate → save → alert."""
+    """Scrape → [day filter] → enrich → evaluate → [vision + bid strategy] → save → alert."""
     threshold = _alert_threshold()
+    profile = load_profile()
     units = await scrape_auction_page(url)
 
     # apply available-days filter before spending API calls on enrichment
@@ -65,6 +70,23 @@ async def _run_full_pipeline(url: str, available_days: Optional[list[str]] = Non
     for unit in units:
         unit.enrichment = enrich_tenant(unit.tenant.name)
         unit.evaluation = evaluate_unit(unit)
+
+        # run vision + bid strategy on high-scoring units that have listing photos
+        if unit.evaluation.score >= VISION_SCORE_THRESHOLD:
+            try:
+                unit.visual_inventory = await analyze_unit_visually(unit.source_url)
+                print(f"[Pipeline] Vision: {unit.visual_inventory.photos_analyzed} photos analyzed "
+                      f"for {unit.tenant.name}")
+            except Exception as e:
+                print(f"[Pipeline] Vision failed for {unit.tenant.name}: {e}")
+
+            try:
+                unit.bid_strategy = build_bid_strategy(unit, unit.visual_inventory, profile)
+                print(f"[Pipeline] Bid strategy: max bid ${unit.bid_strategy.max_bid} "
+                      f"for {unit.tenant.name}")
+            except Exception as e:
+                print(f"[Pipeline] Bid strategy failed for {unit.tenant.name}: {e}")
+
         unit.pipeline_completed = True
         save_auction(unit)
         _maybe_alert(unit, threshold)
@@ -215,6 +237,37 @@ async def discover(req: Optional[DiscoverRequest] = None):
         "day_filter_active": bool(available_days),
         "errors": errors,
     }
+
+
+@app.post("/vision/{auction_id}")
+async def run_vision(auction_id: str):
+    """Run computer vision analysis on a unit's listing photos."""
+    unit = get_auction_by_id(auction_id)
+    if not unit:
+        raise HTTPException(status_code=404, detail="Auction not found")
+    try:
+        unit.visual_inventory = await analyze_unit_visually(unit.source_url)
+        profile = load_profile()
+        if unit.evaluation:
+            unit.bid_strategy = build_bid_strategy(unit, unit.visual_inventory, profile)
+        save_auction(unit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return unit
+
+
+@app.post("/bid-strategy/{auction_id}")
+def run_bid_strategy(auction_id: str):
+    """(Re)calculate bid strategy from existing visual inventory + evaluation."""
+    unit = get_auction_by_id(auction_id)
+    if not unit:
+        raise HTTPException(status_code=404, detail="Auction not found")
+    if not unit.evaluation:
+        raise HTTPException(status_code=400, detail="Evaluate the unit first")
+    profile = load_profile()
+    unit.bid_strategy = build_bid_strategy(unit, unit.visual_inventory, profile)
+    save_auction(unit)
+    return unit
 
 
 @app.post("/research/{auction_id}")

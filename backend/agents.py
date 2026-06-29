@@ -1,5 +1,15 @@
 """
-Lead Scout orchestrator + 5 specialist sub-agents for storage auction intelligence.
+Lead Scout orchestrator + 7 specialist agents for storage auction intelligence.
+
+Agent roster:
+  Lead Scout      — Claude Opus     — orchestrator, final synthesis
+  Researcher      — Claude Haiku    — OSINT / tenant career identification
+  Appraiser       — Claude Haiku    — resale value estimation
+  Location Intel  — Claude Haiku    — neighborhood / facility analysis
+  Risk Analyst    — Claude Haiku    — red flags, hazmat, overbid risk
+  Contents Spec.  — Claude Haiku    — item enumeration by trade
+  Vision Scout    — Claude Sonnet   — computer vision on unit photos
+  Bid Strategist  — Claude Sonnet   — bid progression + time-value math
 """
 import anthropic
 import os
@@ -133,6 +143,45 @@ Flag these specifically:
 Do not soften findings. A skipped bad unit is money saved.
 """
 
+SYSTEM_VISION_SCOUT = """You are the Vision Scout sub-agent for Storage Scout.
+You interpret the output of computer vision analysis on storage unit photos.
+You see what's actually IN the unit — not what OSINT suggests might be there.
+
+Your role in the team:
+- Reconcile visual evidence with OSINT career signals (do the photos match the career?)
+- Highlight items a general bidder would overlook but an experienced reseller would recognize
+- Flag visual red flags: water damage, mold, junk density, hazmat containers
+- Note what's NOT visible — a 10x20 unit with photos only showing one corner may contain
+  much more; factor in the hidden space
+
+When visual data is available, it is ground truth. It overrides speculation.
+When visual data is missing or limited, say so and note the confidence impact.
+"""
+
+SYSTEM_BID_STRATEGIST = """You are the Bid Strategist sub-agent for Storage Scout.
+You convert intelligence from all other agents into a concrete, executable bid plan.
+
+Your output always answers three questions:
+1. What is the realistic net profit at each bid level?
+2. At what price does this unit stop being worth 1 full day of work?
+3. What is the room presence strategy — what to show, when to bid, when to walk?
+
+Bid zone framework:
+  GREEN  (bid freely)     — net profit well above daily target even at this price
+  YELLOW (stay sharp)     — still profitable but margin is thinning; know your exit
+  RED    (final stand)    — last viable bid; if the room goes higher, walk away without regret
+
+Room presence rules:
+- Never show interest in the highest-value item before bidding starts
+- Set your walk-away number before you walk into the room; emotion kills margin
+- If the room is cold (few bidders), start low and let it ride
+- If the room is hot, go straight to your yellow zone and wait for competitors to overbid
+- Experienced pickers know that general bidders overbid on visible furniture and underbid
+  on boxes and shelves — adjust your strategy accordingly
+
+Always give a MAX BID number. Always.
+"""
+
 SYSTEM_CONTENTS_SPECIALIST = """You are the Contents Specialist sub-agent for Storage Scout.
 
 When a trade career is identified, enumerate the specific items most likely in the unit.
@@ -241,12 +290,29 @@ def deep_research_unit(unit: AuctionUnit) -> Iterator[str]:
         "signals are publicly searchable. Rate each risk low/medium/high."
     )
 
+    if unit.visual_inventory and unit.visual_inventory.photos_analyzed > 0:
+        findings["Vision Scout"] = _call_subagent_deep(
+            SYSTEM_VISION_SCOUT, context,
+            "Cross-reference the visual evidence with the OSINT career signals. "
+            "Do the photos confirm what the career search found? What specific items visible "
+            "in the photos would an average bidder overlook? What red flags does the visual show?"
+        )
+
+    if unit.bid_strategy:
+        findings["Bid Strategist"] = _call_subagent_deep(
+            SYSTEM_BID_STRATEGIST, context,
+            "The bid strategy has been pre-calculated. Validate it against the specialist findings. "
+            "Does the max bid account for all risks raised? What is your room presence advice "
+            "for auction day given what we know about this specific unit?"
+        )
+
     specialist_block = "\n\n".join(
         f"**[{name}]**\n{finding}" for name, finding in findings.items()
     )
 
+    agent_count = len(findings)
     synthesis_prompt = f"""You are Lead Scout completing a /deep-research analysis.
-All five specialists have reported. Your job is to cross-reference their findings,
+{agent_count} specialists have reported. Your job is to cross-reference their findings,
 resolve any contradictions, and deliver a final structured report.
 
 UNIT DATA:
@@ -296,10 +362,20 @@ name ambiguity concern undermines Researcher's career confidence.]
 
 **Break-even bid:** $X,XXX
 
-## Final Verdict
-**MAX BID: $X,XXX**
+## Visual Evidence
+[If Vision Scout reported: what photos confirm or contradict. If no photos: note the gap
+and how it affects confidence.]
 
-[2-3 direct sentences. What career, why it matters, what to bid, what to watch for in the room.]
+## Bid Plan
+**MAX BID: $X,XXX** | Break-even: $X,XXX
+- GREEN zone (bid freely): ≤$X,XXX
+- YELLOW zone (stay disciplined): ≤$X,XXX
+- RED zone (final stand): ≤$X,XXX
+
+**Room strategy:** [tactical advice for auction day — what competitors will see vs. what you know]
+
+## Final Verdict
+[2-3 direct sentences. What career, why it matters, whether to bid, and one thing to watch for.]
 """
 
     with client.messages.stream(
@@ -340,6 +416,26 @@ def _build_unit_context(unit: AuctionUnit) -> str:
             f"Career phrases extracted: {', '.join(en.career_signals) or 'none'}",
             f"Business found: {en.business_found}",
         ]
+    if unit.visual_inventory:
+        vi = unit.visual_inventory
+        lines += [
+            f"Photos analyzed: {vi.photos_analyzed}",
+            f"Visual value range: ${vi.total_value_low}–${vi.total_value_high}",
+            f"Total flip hours (visual): {vi.total_flip_hours}h",
+            f"Notable finds: {', '.join(vi.notable_finds) or 'none'}",
+            f"Visual red flags: {', '.join(vi.red_flags) or 'none'}",
+            f"Items seen: {', '.join(i.description for i in vi.items[:6]) or 'none'}",
+        ]
+    if unit.bid_strategy:
+        bs = unit.bid_strategy
+        lines += [
+            f"MAX BID: ${bs.max_bid}",
+            f"Break-even bid: ${bs.break_even_bid}",
+            f"Bid zones — green: ≤${bs.bid_green_ceiling} / yellow: ≤${bs.bid_yellow_ceiling} / red: ≤${bs.bid_red_ceiling}",
+            f"Gross resale estimate: ${bs.estimated_gross_resale}",
+            f"Net ROI at max bid: {bs.expected_roi_at_max_bid}%",
+            f"Room strategy: {bs.room_strategy}",
+        ]
     return "\n".join(lines)
 
 
@@ -349,8 +445,7 @@ def _orchestrate_specialists(user_message: str, unit: AuctionUnit) -> dict[str, 
 
     findings = {}
 
-    # always call researcher and appraiser for bid decisions
-    if any(w in msg_lower for w in ["bid", "buy", "worth", "value", "should i", "recommend"]):
+    if any(w in msg_lower for w in ["bid", "buy", "worth", "value", "should i", "recommend", "how much", "max bid"]):
         findings["Researcher"] = _call_subagent(SYSTEM_RESEARCHER, context,
             "What does the tenant background tell us about likely unit contents?")
         findings["Appraiser"] = _call_subagent(SYSTEM_APPRAISER, context,
@@ -359,15 +454,31 @@ def _orchestrate_specialists(user_message: str, unit: AuctionUnit) -> dict[str, 
             "What specific items are most likely in this unit and what are the best resale channels?")
         findings["Risk Analyst"] = _call_subagent(SYSTEM_RISK_ANALYST, context,
             "What are the key risks for bidding on this unit?")
-        findings["Location Intel"] = _call_subagent(SYSTEM_LOCATION_INTEL, context,
-            "What does the facility location tell us about likely unit contents?")
+        findings["Bid Strategist"] = _call_subagent(SYSTEM_BID_STRATEGIST, context,
+            "Given all available data, what is the max bid and what are the three bid zones? "
+            "What is the room presence strategy?")
+        if unit and unit.visual_inventory:
+            findings["Vision Scout"] = _call_subagent(SYSTEM_VISION_SCOUT, context,
+                "What do the photos confirm or contradict about the OSINT career signals? "
+                "What items stand out from the visual analysis?")
+    elif any(w in msg_lower for w in ["photo", "picture", "image", "see", "look", "visual"]):
+        findings["Vision Scout"] = _call_subagent(SYSTEM_VISION_SCOUT, context, user_message)
+        findings["Contents Specialist"] = _call_subagent(SYSTEM_CONTENTS_SPECIALIST, context,
+            "Cross-reference the visual inventory with career signals — what does it confirm?")
+    elif any(w in msg_lower for w in ["bid strategy", "how much", "max bid", "zone", "room", "auction day"]):
+        findings["Bid Strategist"] = _call_subagent(SYSTEM_BID_STRATEGIST, context, user_message)
     elif any(w in msg_lower for w in ["risk", "danger", "concern", "problem", "flag"]):
         findings["Risk Analyst"] = _call_subagent(SYSTEM_RISK_ANALYST, context, user_message)
+        findings["Vision Scout"] = _call_subagent(SYSTEM_VISION_SCOUT, context,
+            "What visual red flags are present in the photos?")
     elif any(w in msg_lower for w in ["location", "area", "neighborhood", "facility"]):
         findings["Location Intel"] = _call_subagent(SYSTEM_LOCATION_INTEL, context, user_message)
-    elif any(w in msg_lower for w in ["contain", "item", "tool", "equipment", "stuff"]):
+    elif any(w in msg_lower for w in ["contain", "item", "tool", "equipment", "stuff", "cabinet", "furniture"]):
         findings["Contents Specialist"] = _call_subagent(SYSTEM_CONTENTS_SPECIALIST, context, user_message)
         findings["Appraiser"] = _call_subagent(SYSTEM_APPRAISER, context, user_message)
+        if unit and unit.visual_inventory:
+            findings["Vision Scout"] = _call_subagent(SYSTEM_VISION_SCOUT, context,
+                "What specific items are visible in the photos?")
     else:
         findings["Researcher"] = _call_subagent(SYSTEM_RESEARCHER, context, user_message)
 

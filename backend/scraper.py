@@ -81,3 +81,42 @@ Page text:
 async def scrape_auction_page(url: str) -> list[AuctionUnit]:
     page_text = await fetch_page_text(url)
     return extract_units_with_haiku(page_text, url)
+
+
+async def fetch_page_with_photos(url: str) -> tuple[str, list[str]]:
+    """Return (page_text, photo_urls) in one Playwright session to avoid double-loading."""
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+
+        text = await page.inner_text("body")
+
+        images = await page.eval_on_selector_all(
+            "img",
+            """els => els.map(el => ({
+                src: el.src || el.getAttribute('data-src') || '',
+                width: el.naturalWidth || el.width || 0,
+                height: el.naturalHeight || el.height || 0
+            }))"""
+        )
+
+        await browser.close()
+
+    SKIP = ["logo", "icon", "avatar", "button", "banner", "badge", "sprite", "placeholder"]
+    photo_urls = []
+    seen: set[str] = set()
+
+    for img in images:
+        src = img.get("src", "").strip()
+        if not src or src in seen or src.startswith("data:"):
+            continue
+        if img.get("width", 0) < 150 and img.get("height", 0) < 150:
+            continue
+        if any(f in src.lower() for f in SKIP):
+            continue
+        seen.add(src)
+        photo_urls.append(src)
+
+    return text, photo_urls[:6]

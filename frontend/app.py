@@ -115,6 +115,12 @@ if page == "Profile":
                 value=existing["alert_score_threshold"] if existing else 7,
                 help="Units at or above this score get written to alerts.",
             )
+            target_daily_profit = st.number_input(
+                "Target daily profit ($)",
+                min_value=50, max_value=5000, step=50,
+                value=existing.get("target_daily_profit", 300) if existing else 300,
+                help="Min net profit for 1 full day of flip work. Drives max bid calculation.",
+            )
 
         submitted = st.form_submit_button("Save Profile", type="primary", use_container_width=True)
 
@@ -130,6 +136,7 @@ if page == "Profile":
                 "available_days": [d.lower() for d in available_days],
                 "budget_ceiling": budget_ceiling if budget_ceiling > 0 else None,
                 "alert_score_threshold": alert_score_threshold,
+                "target_daily_profit": int(target_daily_profit),
             }
             result = api_post("/profile", payload)
             if result:
@@ -361,6 +368,66 @@ elif page == "Auctions":
                         elif en.get("trade_profession_signals"):
                             st.write(f"**Trade signals:** {', '.join(en['trade_profession_signals'])}")
 
+                # Visual Inventory
+                vi = unit.get("visual_inventory")
+                if vi and vi.get("photos_analyzed", 0) > 0:
+                    st.divider()
+                    st.markdown("**Vision Scout — Visual Inventory**")
+                    vcol1, vcol2, vcol3 = st.columns(3)
+                    vcol1.metric("Photos analyzed", vi["photos_analyzed"])
+                    vcol2.metric("Visual value", f"${vi['total_value_low']:,}–${vi['total_value_high']:,}")
+                    vcol3.metric("Flip hours", f"{vi['total_flip_hours']}h")
+
+                    if vi.get("notable_finds"):
+                        st.success("Notable finds: " + " · ".join(vi["notable_finds"]))
+                    if vi.get("red_flags"):
+                        st.warning("Red flags: " + " · ".join(vi["red_flags"]))
+
+                    if vi.get("items"):
+                        import pandas as pd
+                        rows = [
+                            {
+                                "Item": item["description"],
+                                "Condition": item["condition"],
+                                "Low $": f"${item['resale_low']:,}",
+                                "High $": f"${item['resale_high']:,}",
+                                "Hours": item["flip_hours"],
+                                "Platform": item["best_platform"],
+                            }
+                            for item in vi["items"]
+                        ]
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+                elif ev and not vi:
+                    if st.button("Run Vision Analysis", key=f"vision_{unit['id']}"):
+                        with st.spinner("Analyzing photos with Claude Sonnet..."):
+                            api_post(f"/vision/{unit['id']}", {})
+                        st.rerun()
+
+                # Bid Strategy
+                bs = unit.get("bid_strategy")
+                if bs:
+                    st.divider()
+                    st.markdown("**Bid Strategist — Bid Plan**")
+                    bc1, bc2, bc3, bc4 = st.columns(4)
+                    bc1.metric("MAX BID", f"${bs['max_bid']:,}", delta="red ceiling")
+                    bc2.metric("Break-even", f"${bs['break_even_bid']:,}")
+                    bc3.metric("Gross resale", f"${bs['estimated_gross_resale']:,}")
+                    bc4.metric("ROI at max", f"{bs['expected_roi_at_max_bid']}%")
+
+                    st.markdown(
+                        f"| Zone | Bid up to | Action |\n"
+                        f"|---|---|---|\n"
+                        f"| 🟢 GREEN | ${bs['bid_green_ceiling']:,} | Bid freely |\n"
+                        f"| 🟡 YELLOW | ${bs['bid_yellow_ceiling']:,} | Stay disciplined |\n"
+                        f"| 🔴 RED | ${bs['bid_red_ceiling']:,} | Final stand — walk away above this |"
+                    )
+
+                    if bs.get("room_strategy"):
+                        st.info(f"**Room strategy:** {bs['room_strategy']}")
+                    if bs.get("summary"):
+                        st.caption(f"**Summary:** {bs['summary']}")
+
                 # Deep Research
                 if ev:
                     st.divider()
@@ -372,7 +439,7 @@ elif page == "Auctions":
                         try:
                             with requests.post(
                                 f"{API_BASE}/research/{unit['id']}",
-                                stream=True, timeout=120,
+                                stream=True, timeout=180,
                             ) as r:
                                 for line in r.iter_lines():
                                     if line:
