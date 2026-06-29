@@ -1,6 +1,6 @@
 """
 Phase 5: Auto-Discovery
-Scrapes StorageTreasures.com and Bid13 for auction notices.
+Scrapes StorageTreasures.com, Bid13, and StorageAuctions.net for auction notices.
 Integrates with the user profile for ZIP radius expansion and available-day filtering.
 """
 import asyncio
@@ -9,6 +9,7 @@ from typing import Optional
 from playwright.async_api import async_playwright
 from .storage import get_existing_urls
 from .models import AuctionUnit
+from .sources.storageauctions_net import discover_storage_auctions_net
 
 WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
@@ -123,13 +124,17 @@ async def discover_new_auctions(zip_codes: list[str]) -> list[str]:
     """Return URLs of auction notice pages not already in the database."""
     existing = get_existing_urls()
 
-    st_urls, b13_urls = await asyncio.gather(
+    st_urls, b13_urls, san_urls = await asyncio.gather(
         _discover_storage_treasures(zip_codes),
         _discover_bid13(zip_codes),
+        discover_storage_auctions_net(zip_codes),
     )
 
-    all_discovered = st_urls + b13_urls
+    all_discovered = st_urls + b13_urls + san_urls
     new_urls = [url for url in all_discovered if url not in existing]
 
-    print(f"[Discovery] Found {len(all_discovered)} total, {len(new_urls)} new across {len(zip_codes)} ZIP(s)")
+    print(
+        f"[Discovery] ST={len(st_urls)} Bid13={len(b13_urls)} SAN={len(san_urls)} "
+        f"total={len(all_discovered)} new={len(new_urls)} across {len(zip_codes)} ZIP(s)"
+    )
     return new_urls
